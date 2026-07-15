@@ -1,0 +1,169 @@
+name: Windows 11 RDP Setup
+on:
+  workflow_dispatch:
+    inputs:
+      vm_name:
+        description: 'VM Name'
+        required: true
+        default: 'win11-rdp'
+      vm_zone:
+        description: 'GCP Zone'
+        required: true
+        default: 'us-central1-a'
+      rdp_password:
+        description: 'RDP Password (leave blank for auto-generate)'
+        required: false
+        type: string
+
+jobs:
+  create-windows-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+    environment:
+      name: gcp
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          export_default_credentials: true
+
+      - name: Generate RDP Password
+        id: gen-pass
+        run: |
+          if [ -z "${{ github.event.inputs.rdp_password }}" ]; then
+            PASSWORD=$(openssl rand -base64 12 | tr -d "=+/" | cut -c1-12)
+            echo "password=$PASSWORD" >> $GITHUB_OUTPUT
+          else
+            echo "password=${{ github.event.inputs.rdp_password }}" >> $GITHUB_OUTPUT
+          fi
+          echo "Generated password"
+
+      - name: Create Windows 11 VM
+        run: |
+          VM_NAME="${{ github.event.inputs.vm_name }}-${{ github.run_id }}"
+          ZONE="${{ github.event.inputs.vm_zone }}"
+          PASSWORD="${{ steps.gen-pass.outputs.password }}"
+          
+          # Create VM
+          gcloud compute instances create $VM_NAME \
+            --zone=$ZONE \
+            --machine-type=n2-standard-4 \
+            --image-family=windows-11-desktop \
+            --image-project=windows-cloud \
+            --boot-disk-size=100GB \
+            --boot-disk-type=pd-ssd \
+            --enable-nested-virtualization \
+            --metadata=enable-windows-ssh=true,serial-port-enable=true \
+            --metadata-from-file=windows-startup-script-ps1=<(echo "
+              # Enable RDP
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+              
+              # Set password
+              net user Administrator $PASSWORD
+              wmic UserAccount where Name='Administrator' set PasswordExpires=False
+              
+              # Open firewall for RDP
+              netsh advfirewall firewall set rule group='remote desktop' new enable=Yes
+              netsh advfirewall firewall add rule name='RDP-Open' dir=in action=allow protocol=TCP localport=3389
+              
+              # Disable Windows Firewall (optional)
+              netsh advfirewall set allprofiles state off
+              
+              # Install Chrome for convenience
+              Start-Process -Wait -FilePath 'C:\Program Files\Google\Chrome\Application\chrome.exe' -ArgumentList '--silent-install' -ErrorAction SilentlyContinue
+            ") \
+            --tags=rdp-server,http-server,https-server
+
+      - name: Get VM External IP
+        run: |
+          VM_NAME="${{ github.event.inputs.vm_name }}-${{ github.run_id }}"
+          ZONE="${{ github.event.inputs.vm_zone }}"
+          
+          EXTERNAL_IP=$(gcloud compute instances describe $VM_NAME --zone=$ZONE --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+          INTERNAL_IP=$(gcloud compute instances describe $VM_NAME --zone=$ZONE --format='get(networkInterfaces[0].networkIP)')
+          
+          echo "EXTERNAL_IP=$EXTERNAL_IP" >> $GITHUB_ENV
+          echo "INTERNAL_IP=$INTERNAL_IP" >> $GITHUB_ENV
+          echo "VM_NAME=$VM_NAME" >> $GITHUB_ENV
+
+      - name: Create Firewall Rule for RDP
+        run: |
+          gcloud compute firewall-rules create rdp-${{ github.run_id }} \
+            --allow=tcp:3389 \
+            --source-ranges=0.0.0.0/0 \
+            --target-tags=rdp-server \
+            --description="RDP access for Windows 11 VM"
+
+      - name: Wait for VM to be Ready
+        run: |
+          echo "Waiting for Windows 11 VM to initialize (this may take 5-10 minutes)..."
+          sleep 300
+          
+          VM_NAME="${{ env.VM_NAME }}"
+          ZONE="${{ github.event.inputs.vm_zone }}"
+          
+          # Wait for RDP port to be open
+          for i in {1..30}; do
+            if gcloud compute ssh $VM_NAME --zone=$ZONE --command="exit" 2>/dev/null; then
+              echo "VM is ready!"
+              break
+            fi
+            echo "Waiting for VM to be ready... ($i/30)"
+            sleep 30
+          done
+
+      - name: Setup RDP Tunnel via Cloud Shell
+        run: |
+          echo "=== RDP CONNECTION DETAILS ==="
+          echo "VM Name: ${{ env.VM_NAME }}"
+          echo "External IP: ${{ env.EXTERNAL_IP }}"
+          echo "Internal IP: ${{ env.INTERNAL_IP }}"
+          echo "Username: Administrator"
+          echo "Password: ${{ steps.gen-pass.outputs.password }}"
+          echo "================================"
+          
+          echo "RDP_CREDS=Username: Administrator | Password: ${{ steps.gen-pass.outputs.password }}" >> $GITHUB_ENV
+          echo "RDP_IP=${{ env.EXTERNAL_IP }}" >> $GITHUB_ENV
+
+      - name: Keep VM Alive
+        run: |
+          echo "Windows 11 VM is now ready for RDP connection!"
+          echo ""
+          echo "📝 CONNECTION INSTRUCTIONS:"
+          echo "========================================="
+          echo "1. Use any RDP client (Remote Desktop)"
+          echo "2. IP Address: ${{ env.EXTERNAL_IP }}"
+          echo "3. Username: Administrator"
+          echo "4. Password: ${{ steps.gen-pass.outputs.password }}"
+          echo "========================================="
+          echo ""
+          echo "⚠️  IMPORTANT: This VM will be deleted when this workflow finishes!"
+          echo "To keep it running, don't cancel this workflow."
+          echo ""
+          echo "Press Ctrl+C to cancel and delete the VM"
+          
+          # Keep the workflow running
+          while true; do
+            echo "[$(date)] Windows 11 VM Running - Connect now!"
+            echo "RDP: ${{ env.EXTERNAL_IP }} | User: Administrator"
+            sleep 60
+          done
+
+      - name: Cleanup VM (on cancel/complete)
+        if: always()
+        run: |
+          VM_NAME="${{ env.VM_NAME }}"
+          ZONE="${{ github.event.inputs.vm_zone }}"
+          
+          if gcloud compute instances describe $VM_NAME --zone=$ZONE --format='get(name)' 2>/dev/null; then
+            echo "Deleting VM: $VM_NAME"
+            gcloud compute instances delete $VM_NAME --zone=$ZONE --quiet
+            gcloud compute firewall-rules delete rdp-${{ github.run_id }} --quiet || true
+          fi
